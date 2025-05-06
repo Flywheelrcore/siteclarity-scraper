@@ -16,18 +16,18 @@ app.post("/scrape", async (req, res) => {
 
     const page = await browser.newPage();
 
-    // Robust page setup
+    // Set up user agent, viewport, timeout
     await page.setUserAgent("Mozilla/5.0 (compatible; SiteClarityBot/1.0)");
     await page.setViewport({ width: 1280, height: 800 });
-    await page.setDefaultNavigationTimeout(30000); // 30s
+    await page.setDefaultNavigationTimeout(60000); // ⏱ 60s overall timeout
 
-    // Go to the page
-    await page.goto(url, { waitUntil: "networkidle2", timeout: 20000 });
+    // Navigate to the page
+    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 40000 }); // ⏳ 40s page-specific timeout
 
-    // ✅ Use Puppeteer-compatible delay
-    await new Promise(resolve => setTimeout(resolve, 1000));
+    // Wait extra time if needed for late assets to load
+    await new Promise(resolve => setTimeout(resolve, 1500)); // 1.5s buffer
 
-    // Capture full page screenshot
+    // Take full page screenshot
     const screenshotBuffer = await page.screenshot({ fullPage: true });
     const screenshotBase64 = screenshotBuffer.toString("base64");
 
