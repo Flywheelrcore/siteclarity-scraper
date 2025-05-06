@@ -12,8 +12,12 @@ app.post("/scrape", async (req, res) => {
     const browser = await puppeteer.launch({
       args: ["--no-sandbox", "--disable-setuid-sandbox"]
     });
+
     const page = await browser.newPage();
-    await page.goto(url, { waitUntil: "domcontentloaded" });
+
+    // 🛠 Add navigation timeout + faster load strategy
+    await page.setDefaultNavigationTimeout(20000);
+    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 15000 });
 
     const sections = {};
 
@@ -34,11 +38,12 @@ app.post("/scrape", async (req, res) => {
         found: true,
         text,
         html
-        // optional: screenshot could be added later
+        // future: add screenshot support
       };
     }
 
     await browser.close();
+
     return res.json({ success: true, sections });
   } catch (err) {
     console.error("Scraping error:", err.message);
@@ -60,5 +65,5 @@ function getSelectorForSection(sectionId) {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`Scraper running on port ${PORT}`);
+  console.log(`✅ Scraper running on port ${PORT}`);
 });
