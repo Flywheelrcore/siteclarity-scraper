@@ -5,7 +5,7 @@ const app = express();
 app.use(express.json());
 
 app.post("/scrape", async (req, res) => {
-  const { url } = req.body;
+  const { url, sectionIds = [] } = req.body;
   if (!url) return res.status(400).json({ error: "Missing URL" });
 
   try {
@@ -15,16 +15,48 @@ app.post("/scrape", async (req, res) => {
     const page = await browser.newPage();
     await page.goto(url, { waitUntil: "domcontentloaded" });
 
-    const title = await page.title();
-    const html = await page.content();
+    const sections = {};
+
+    for (const section of sectionIds) {
+      const selector = getSelectorForSection(section);
+      if (!selector) continue;
+
+      const elementHandle = await page.$(selector);
+      if (!elementHandle) {
+        sections[section] = { found: false, text: null, html: null };
+        continue;
+      }
+
+      const text = await page.evaluate(el => el.innerText, elementHandle);
+      const html = await page.evaluate(el => el.outerHTML, elementHandle);
+
+      sections[section] = {
+        found: true,
+        text,
+        html
+        // optional: screenshot could be added later
+      };
+    }
 
     await browser.close();
-    return res.json({ title, html });
+    return res.json({ success: true, sections });
   } catch (err) {
     console.error("Scraping error:", err.message);
-    res.status(500).json({ error: "Failed to scrape page." });
+    return res.status(500).json({ success: false, error: err.message });
   }
 });
+
+function getSelectorForSection(sectionId) {
+  const map = {
+    hero: "header, .hero, #hero, .banner",
+    services: "#services, .services, section.services",
+    trust: ".trust-strip, .social-proof, .logos",
+    caseStudies: "#case-studies, .case-studies",
+    cta: "footer .cta, .call-to-action",
+    footer: "footer"
+  };
+  return map[sectionId] || null;
+}
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
