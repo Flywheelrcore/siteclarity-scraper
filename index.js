@@ -1,11 +1,10 @@
 const express = require("express");
 const puppeteer = require("puppeteer");
-
 const app = express();
 app.use(express.json());
 
 app.post("/scrape", async (req, res) => {
-  const { url, sectionIds = [] } = req.body;
+  const { url } = req.body;
   if (!url) return res.status(400).json({ error: "Missing URL" });
 
   try {
@@ -14,56 +13,26 @@ app.post("/scrape", async (req, res) => {
     });
 
     const page = await browser.newPage();
+    await page.setViewport({ width: 1280, height: 800 });
 
-    // 🛠 Add navigation timeout + faster load strategy
-    await page.setDefaultNavigationTimeout(20000);
-    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 15000 });
+    await page.goto(url, { waitUntil: "networkidle2", timeout: 30000 });
 
-    const sections = {};
-
-    for (const section of sectionIds) {
-      const selector = getSelectorForSection(section);
-      if (!selector) continue;
-
-      const elementHandle = await page.$(selector);
-      if (!elementHandle) {
-        sections[section] = { found: false, text: null, html: null };
-        continue;
-      }
-
-      const text = await page.evaluate(el => el.innerText, elementHandle);
-      const html = await page.evaluate(el => el.outerHTML, elementHandle);
-
-      sections[section] = {
-        found: true,
-        text,
-        html
-        // future: add screenshot support
-      };
-    }
+    const buffer = await page.screenshot({ fullPage: true });
 
     await browser.close();
 
-    return res.json({ success: true, sections });
+    // Return base64 for now — for visual confirmation
+    return res.json({
+      success: true,
+      screenshot_base64: buffer.toString("base64")
+    });
   } catch (err) {
-    console.error("Scraping error:", err.message);
-    return res.status(500).json({ success: false, error: err.message });
+    console.error("Screenshot error:", err.message);
+    return res.status(500).json({ error: err.message });
   }
 });
 
-function getSelectorForSection(sectionId) {
-  const map = {
-    hero: "header, .hero, #hero, .banner",
-    services: "#services, .services, section.services",
-    trust: ".trust-strip, .social-proof, .logos",
-    caseStudies: "#case-studies, .case-studies",
-    cta: "footer .cta, .call-to-action",
-    footer: "footer"
-  };
-  return map[sectionId] || null;
-}
-
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`✅ Scraper running on port ${PORT}`);
+  console.log(`🖼️ Scraper running on port ${PORT}`);
 });
