@@ -6,34 +6,42 @@ app.use(express.json());
 
 app.post("/scrape", async (req, res) => {
   const { url } = req.body;
-  if (!url) return res.status(400).json({ error: "Missing URL" });
+  if (!url) return res.status(400).json({ success: false, error: "Missing URL" });
 
   try {
     const browser = await puppeteer.launch({
+      headless: true,
       args: ["--no-sandbox", "--disable-setuid-sandbox"]
     });
 
     const page = await browser.newPage();
-    await page.setViewport({ width: 1280, height: 900 });
-    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 20000 });
 
-    // Capture desktop screenshot
-    const desktopBuffer = await page.screenshot({ fullPage: true });
-    const desktopBase64 = desktopBuffer.toString("base64");
+    // Robust page setup
+    await page.setUserAgent("Mozilla/5.0 (compatible; SiteClarityBot/1.0)");
+    await page.setViewport({ width: 1280, height: 800 });
+    await page.setDefaultNavigationTimeout(30000); // 30s
 
-    // Simulate mobile view
-    await page.setViewport({ width: 375, height: 812, isMobile: true });
-    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 20000 });
+    // Go to the page
+    await page.goto(url, { waitUntil: "networkidle2", timeout: 20000 });
 
-    const mobileBuffer = await page.screenshot({ fullPage: true });
-    const mobileBase64 = mobileBuffer.toString("base64");
+    // Add artificial delay to let things load if needed
+    await page.waitForTimeout(1000);
+
+    // Capture full page screenshot
+    const screenshotBuffer = await page.screenshot({ fullPage: true });
+    const screenshotBase64 = screenshotBuffer.toString("base64");
 
     await browser.close();
 
     return res.json({
       success: true,
-      screenshotDesktopBase64: desktopBase64,
-      screenshotMobileBase64: mobileBase64
+      screenshotBase64,
+      extracted_content: {
+        headline: "",
+        subheadline: "",
+        cta_text: "",
+        supporting_text: []
+      }
     });
   } catch (err) {
     console.error("Scraping error:", err.message);
