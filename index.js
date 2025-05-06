@@ -1,7 +1,5 @@
 const express = require("express");
 const puppeteer = require("puppeteer");
-const fs = require("fs");
-const path = require("path");
 
 const app = express();
 app.use(express.json());
@@ -12,18 +10,26 @@ app.post("/scrape", async (req, res) => {
 
   try {
     const browser = await puppeteer.launch({
-      args: ["--no-sandbox", "--disable-setuid-sandbox"],
-      headless: true
+      headless: "new", // Use newer stable mode
+      args: [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-gpu",
+        "--disable-dev-shm-usage",
+        "--no-zygote",
+        "--single-process"
+      ]
     });
 
     const page = await browser.newPage();
 
-    await page.setViewport({ width: 1280, height: 800 });
-    await page.setDefaultNavigationTimeout(30000);
-    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 20000 });
+    await page.setViewport({ width: 1200, height: 800 });
+    await page.setDefaultNavigationTimeout(20000);
+    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 15000 });
+
+    const screenshotBuffer = await page.screenshot({ type: "jpeg", fullPage: true });
 
     const sections = {};
-
     for (const section of sectionIds) {
       const selector = getSelectorForSection(section);
       if (!selector) continue;
@@ -44,16 +50,12 @@ app.post("/scrape", async (req, res) => {
       };
     }
 
-    // 📸 Add Screenshot Capture BEFORE closing browser
-    const screenshotBuffer = await page.screenshot({ fullPage: true });
-    const base64Screenshot = screenshotBuffer.toString("base64");
-
     await browser.close();
 
     return res.json({
       success: true,
-      sections,
-      screenshot: `data:image/png;base64,${base64Screenshot}`
+      screenshotBase64: screenshotBuffer.toString("base64"),
+      sections
     });
   } catch (err) {
     console.error("Scraping error:", err.message);
