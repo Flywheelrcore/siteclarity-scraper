@@ -219,7 +219,7 @@ async function identifySectionsWithGPT4Vision(screenshotBase64) {
         'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`
       },
       body: JSON.stringify({
-        model: "gpt-4-vision-preview",
+        model: "gpt-4o", // UPDATED: Using gpt-4o instead of gpt-4-vision-preview
         messages: [
           {
             role: "user",
@@ -377,7 +377,7 @@ async function analyzeSectionWithGPT4Vision(screenshotBase64, sectionType) {
         'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`
       },
       body: JSON.stringify({
-        model: "gpt-4-vision-preview",
+        model: "gpt-4o", // UPDATED: Using gpt-4o instead of gpt-4-vision-preview
         messages: [
           {
             role: "user",
