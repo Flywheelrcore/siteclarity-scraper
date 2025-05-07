@@ -1,12 +1,19 @@
 {
   "name": "siteclarity-scraper",
   "version": "1.0.0",
+  "description": "Website screenshot service for SiteClarity",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "dev": "nodemon index.js"
   },
   "dependencies": {
     "express": "^4.18.2",
-    "puppeteer": "^22.8.2"
+    "puppeteer": "^19.7.2",
+    "puppeteer-extra": "^3.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2"
+  },
+  "engines": {
+    "node": ">=16.0.0"
   }
 }
