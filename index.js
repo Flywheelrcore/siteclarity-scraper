@@ -1,11 +1,15 @@
 const express = require("express");
-const puppeteer = require("puppeteer");
+const puppeteer = require("puppeteer-extra");
+const StealthPlugin = require("puppeteer-extra-plugin-stealth");
+puppeteer.use(StealthPlugin());
 const app = express();
 app.use(express.json());
 
 app.post("/scrape", async (req, res) => {
   const { url } = req.body;
   if (!url) return res.status(400).json({ success: false, error: "Missing URL" });
+  
+  let browser = null;
   
   try {
     // Enhanced URL normalization
@@ -16,91 +20,130 @@ app.post("/scrape", async (req, res) => {
     
     console.log(`🔍 Attempting to scrape: ${normalizedUrl}`);
     
-    const browser = await puppeteer.launch({
+    // Launch with stealth mode and additional arguments
+    browser = await puppeteer.launch({
       headless: true,
       args: [
         "--no-sandbox", 
         "--disable-setuid-sandbox",
         "--disable-web-security",
-        "--disable-features=IsolateOrigins,site-per-process"
+        "--disable-features=IsolateOrigins,site-per-process",
+        "--disable-site-isolation-trials",
+        "--disable-blink-features=AutomationControlled",
+        "--disable-dev-shm-usage",
+        "--disable-accelerated-2d-canvas",
+        "--disable-gpu"
       ]
     });
     
     const page = await browser.newPage();
     
-    // More robust error handling
-    page.on('error', err => {
-      console.error('Page error:', err);
-    });
+    // Set a realistic user agent
+    await page.setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/113.0.0.0 Safari/537.36");
     
-    page.on('pageerror', err => {
-      console.error('Page JS error:', err);
-    });
-    
-    // Set up user agent, viewport, timeout
-    await page.setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/96.0.4664.110 Safari/537.36");
+    // Set viewport
     await page.setViewport({ width: 1280, height: 800 });
-    await page.setDefaultNavigationTimeout(90000); // 90s timeout
     
-    console.log(`⏱ Navigating to page...`);
-    
-    // Navigate with more robust error handling
-    try {
-      await page.goto(normalizedUrl, { 
-        waitUntil: "domcontentloaded", 
-        timeout: 60000 
+    // Bypass common bot detection
+    await page.evaluateOnNewDocument(() => {
+      // Pass webdriver check
+      Object.defineProperty(navigator, 'webdriver', {
+        get: () => false,
       });
-      console.log(`✅ Page loaded successfully`);
-    } catch (navError) {
-      console.error(`❌ Navigation error:`, navError.message);
+      
+      // Pass Chrome check
+      window.chrome = {
+        runtime: {},
+      };
+      
+      // Pass notifications check
+      const originalQuery = window.navigator.permissions.query;
+      window.navigator.permissions.query = (parameters) => (
+        parameters.name === 'notifications' ?
+          Promise.resolve({ state: Notification.permission }) :
+          originalQuery(parameters)
+      );
+    });
+    
+    // Set request timeout to 2 minutes
+    await page.setDefaultNavigationTimeout(120000);
+    
+    // Define a function to take screenshots with error handling
+    const takeScreenshot = async (isMobile = false) => {
+      try {
+        // Set appropriate viewport
+        if (isMobile) {
+          await page.setViewport({ 
+            width: 390, 
+            height: 844, 
+            isMobile: true,
+            hasTouch: true 
+          });
+          
+          // Wait for mobile layout to adjust
+          await new Promise(resolve => setTimeout(resolve, 2000));
+          
+          console.log("📱 Taking mobile screenshot...");
+          const buffer = await page.screenshot({ fullPage: false });
+          return buffer.toString("base64");
+        } else {
+          // Desktop screenshot
+          console.log("📸 Taking desktop screenshot...");
+          const buffer = await page.screenshot({ fullPage: true });
+          return buffer.toString("base64");
+        }
+      } catch (error) {
+        console.error(`Screenshot error (${isMobile ? 'mobile' : 'desktop'}):`, error.message);
+        return ""; // Return empty string on error
+      }
+    };
+    
+    // Try to navigate to the page with retry logic
+    let navigationSuccess = false;
+    let attempts = 0;
+    let maxAttempts = 3;
+    
+    while (!navigationSuccess && attempts < maxAttempts) {
+      attempts++;
+      try {
+        console.log(`⏱ Navigation attempt ${attempts}/${maxAttempts}...`);
+        
+        await page.goto(normalizedUrl, { 
+          waitUntil: "networkidle2", 
+          timeout: 60000 
+        });
+        
+        // Wait for content to stabilize
+        await new Promise(resolve => setTimeout(resolve, 3000));
+        
+        // Check if we have a real page (not an error page)
+        const pageTitle = await page.title();
+        console.log(`📄 Page title: "${pageTitle}"`);
+        
+        navigationSuccess = true;
+      } catch (error) {
+        console.error(`Navigation error (attempt ${attempts}/${maxAttempts}):`, error.message);
+        
+        if (attempts >= maxAttempts) {
+          console.error("❌ All navigation attempts failed");
+          break;
+        }
+        
+        // Wait before retry
+        await new Promise(resolve => setTimeout(resolve, 2000));
+      }
+    }
+    
+    // Take screenshots even if navigation wasn't completely successful
+    const screenshotBase64 = await takeScreenshot(false); // Desktop
+    const mobileScreenshotBase64 = await takeScreenshot(true); // Mobile
+    
+    // Close browser
+    if (browser) {
       await browser.close();
-      return res.status(500).json({ 
-        success: false, 
-        error: `Failed to load page: ${navError.message}` 
-      });
     }
     
-    // Wait for content to stabilize
-    console.log(`⏲ Waiting for page content to stabilize...`);
-    await new Promise(resolve => setTimeout(resolve, 3000));
-    
-    // Take desktop screenshot with error handling
-    console.log(`📸 Taking desktop screenshot...`);
-    let screenshotBase64;
-    try {
-      const desktopScreenshotBuffer = await page.screenshot({ fullPage: true });
-      screenshotBase64 = desktopScreenshotBuffer.toString("base64");
-      console.log(`✅ Desktop screenshot captured (${screenshotBase64.length} bytes)`);
-    } catch (ssError) {
-      console.error(`❌ Desktop screenshot error:`, ssError.message);
-      screenshotBase64 = "";
-    }
-    
-    // Set mobile viewport and take mobile screenshot
-    console.log(`📱 Setting up mobile viewport...`);
-    try {
-      await page.setViewport({ 
-        width: 390, 
-        height: 844, 
-        isMobile: true,
-        hasTouch: true 
-      });
-      
-      // Allow time for responsive layout to adjust
-      await new Promise(resolve => setTimeout(resolve, 2000));
-      
-      console.log(`📱 Taking mobile screenshot...`);
-      const mobileScreenshotBuffer = await page.screenshot({ fullPage: false });
-      var mobileScreenshotBase64 = mobileScreenshotBuffer.toString("base64");
-      console.log(`✅ Mobile screenshot captured (${mobileScreenshotBase64.length} bytes)`);
-    } catch (mobileError) {
-      console.error(`❌ Mobile screenshot error:`, mobileError.message);
-      mobileScreenshotBase64 = "";
-    }
-    
-    await browser.close();
-    console.log(`✅ Browser closed, returning response`);
-    
+    // Return what we have, even if incomplete
     return res.json({
       success: true,
       screenshotBase64,
@@ -114,6 +157,16 @@ app.post("/scrape", async (req, res) => {
     });
   } catch (err) {
     console.error("❌ Scraping error:", err.message);
+    
+    // Make sure browser is closed even on error
+    if (browser) {
+      try {
+        await browser.close();
+      } catch (closeErr) {
+        console.error("Error closing browser:", closeErr.message);
+      }
+    }
+    
     return res.status(500).json({ success: false, error: err.message });
   }
 });
