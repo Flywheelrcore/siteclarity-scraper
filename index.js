@@ -18,7 +18,7 @@ const SECTION_TYPES = [
 ];
 
 app.post("/scrape", async (req, res) => {
-  const { url } = req.body;
+  const { url, analysisMode = "summary" } = req.body;
   if (!url) return res.status(400).json({ success: false, error: "Missing URL" });
   
   let browser = null;
@@ -30,7 +30,7 @@ app.post("/scrape", async (req, res) => {
       normalizedUrl = "https://" + normalizedUrl;
     }
     
-    console.log(`🔍 Attempting to scrape: ${normalizedUrl}`);
+    console.log(`🔍 Attempting to scrape: ${normalizedUrl} with analysis mode: ${analysisMode}`);
     
     // Launch with stealth mode and additional arguments
     browser = await puppeteer.launch({
@@ -150,30 +150,59 @@ app.post("/scrape", async (req, res) => {
     const screenshotBase64 = await takeScreenshot(false); // Desktop
     const mobileScreenshotBase64 = await takeScreenshot(true); // Mobile
 
-    // Use GPT-4 Vision to analyze and identify sections
+    // PHASE 1: Identify logical sections from full page screenshot
+    let identifiedSections = [];
     let sectionAnalyses = [];
+    
     if (process.env.OPENAI_API_KEY && screenshotBase64) {
       try {
-        console.log("🧠 Using GPT-4 Vision to identify page sections...");
+        console.log("🧠 Using GPT-4 Vision to identify logical page sections...");
         
-        // First identify the sections with improved prompt
-        const sections = await identifySectionsWithGPT4Vision(`data:image/png;base64,${screenshotBase64}`);
+        // Identify sections with human-like perception
+        identifiedSections = await identifyLogicalSectionsWithGPT4Vision(`data:image/png;base64,${screenshotBase64}`);
         
-        if (sections && sections.length > 0) {
-          console.log(`✅ Identified ${sections.length} sections on the page before deduplication`);
+        if (identifiedSections && identifiedSections.length > 0) {
+          console.log(`✅ Identified ${identifiedSections.length} logical sections on the page`);
           
-          // Deduplicate sections to avoid redundancy
-          const uniqueSections = deduplicateSections(sections);
-          console.log(`✅ Reduced to ${uniqueSections.length} unique sections after deduplication`);
+          // Handle duplicate section types
+          const sectionsByType = {};
+          identifiedSections.forEach((section, index) => {
+            const sectionType = section.type;
+            if (sectionsByType[sectionType]) {
+              // If this type already exists, append index to make unique
+              section.type = `${sectionType} ${index + 1}`;
+            } else {
+              sectionsByType[sectionType] = true;
+            }
+          });
           
-          // For each section, capture a screenshot and analyze it
-          sectionAnalyses = await captureAndAnalyzeSections(page, uniqueSections);
+          // Calculate viewport width/height for coordinates
+          const dimensions = await page.evaluate(() => {
+            return {
+              width: document.documentElement.scrollWidth,
+              height: document.documentElement.scrollHeight
+            };
+          });
           
-          console.log(`✅ Completed analysis for ${sectionAnalyses.length} sections`);
+          console.log(`Page dimensions: ${dimensions.width}x${dimensions.height}`);
+          
+          // PHASE 2: Based on analysis mode, perform appropriate level of analysis
+          if (analysisMode === "summary") {
+            // For summary mode: Perform lightweight analysis for quick results
+            sectionAnalyses = await performLightweightAnalysis(page, identifiedSections, dimensions);
+          } else if (analysisMode === "detailed") {
+            // For detailed mode: Perform comprehensive analysis with full audit framework
+            sectionAnalyses = await performDetailedAnalysis(page, identifiedSections, dimensions);
+          } else {
+            // Default to summary if mode is unknown
+            sectionAnalyses = await performLightweightAnalysis(page, identifiedSections, dimensions);
+          }
+          
+          console.log(`✅ Completed ${analysisMode} analysis for ${sectionAnalyses.length} sections`);
         }
       } catch (visionError) {
         console.error("❌ Error during section analysis:", visionError.message);
-        // Continue with basic scraping if section analysis fails
+        // Continue with basic data if analysis fails
       }
     } else {
       console.log("⚠️ OpenAI API key not set or screenshot failed - skipping section analysis");
@@ -184,12 +213,13 @@ app.post("/scrape", async (req, res) => {
       await browser.close();
     }
     
-    // Return what we have, even if incomplete
+    // Return what we have, with mode information
     return res.json({
       success: true,
+      analysisMode,
       screenshotBase64,
       mobileScreenshotBase64,
-      sectionAnalyses, // Include the section analyses in the response
+      sectionAnalyses,
       extracted_content: {
         headline: "",
         subheadline: "",
@@ -213,77 +243,48 @@ app.post("/scrape", async (req, res) => {
   }
 });
 
-// Function to deduplicate sections based on position and type
-function deduplicateSections(sections) {
-  // Sort sections by vertical position (top coordinate)
-  const sortedSections = [...sections].sort((a, b) => a.coordinates.top - b.coordinates.top);
-  
-  // Group sections by type
-  const sectionsByType = {};
-  const finalSections = [];
-  
-  sortedSections.forEach(section => {
-    const type = section.type;
-    
-    // If we haven't seen this type before, add it
-    if (!sectionsByType[type]) {
-      sectionsByType[type] = section;
-      finalSections.push(section);
-    } else {
-      // If we have seen this type, only add if it's significantly different in position
-      const existingSection = sectionsByType[type];
-      const positionDifference = Math.abs(section.coordinates.top - existingSection.coordinates.top);
-      
-      // If the section is more than 20% of page height away from the existing one, consider it distinct
-      if (positionDifference > 20) {
-        // Add with modified type to indicate it's a second instance
-        finalSections.push({
-          ...section,
-          type: `${type} (Additional)`
-        });
-      }
-    }
-  });
-  
-  return finalSections;
-}
-
-// Function to identify sections using GPT-4 Vision
-async function identifySectionsWithGPT4Vision(screenshotBase64) {
+// New function to identify logical sections using a human-like approach
+async function identifyLogicalSectionsWithGPT4Vision(screenshotBase64) {
   try {
-    const sectionIdentificationPrompt = `Analyze this website screenshot and identify the main horizontal sections.
+    const sectionIdentificationPrompt = `You are a website consultant analyzing a full webpage. Your task is to divide this page into logical, meaningful sections as a human business analyst would.
 
-For each section, consider complete horizontal elements that span across the page. For example, a hero section typically spans the entire width at the top of the page.
-
-Only identify main content sections that are distinct parts of the user journey, not small UI elements or sub-components.
+1. Start from the top and work your way down
+2. Identify where each distinct section begins and ends
+3. Name each section based on its apparent purpose (not technical structure)
 
 For each section you identify, provide:
-1. section_type (choose ONLY from this list: 
-   - Hero Section: The top area with main heading/value proposition
-   - Problem Statement: Area highlighting pain points or challenges
-   - Solution/Services: Area describing offerings or how problems are solved
-   - Trust/Proof Elements: Client logos, testimonials, awards, social proof
-   - Case Studies: Detailed examples of work or success stories
-   - Call to Action: Areas designed to prompt user action
-   - Thought Leadership: Content like blogs, resources, or insights
-   - Footer: Bottom section with contact info and navigation
-)
-2. coordinates as percentages of the image (top, right, bottom, left)
-   - Ensure sections span the full width where appropriate (left near 0, right near 100)
-   - Avoid overlapping sections
-3. brief description of what the section contains
+1. A descriptive name that matches how a business user would describe it (e.g., "Hero Section", "Customer Testimonials", "Pricing Plans")
+2. Coordinates as percentages of the full image (top, right, bottom, left)
+3. Brief description of what this section accomplishes
 
-Return the results as a valid JSON array with objects containing: 
-{
-  "type": "section type name",
-  "coordinates": {
-    "top": number,
-    "right": number,
-    "bottom": number,
-    "left": number
+Guidelines:
+- A section typically represents a complete thought or purpose
+- Sections generally span the full width of the page
+- Look for visual breaks (background changes, large spaces, horizontal rules)
+- Consider user attention span - what would a user perceive as a complete unit?
+- Identify 5-10 main sections, not every small element
+
+Preferred section types (use when applicable, but don't force if not present):
+- Hero Section
+- Trust/Proof Elements (logos, testimonials)
+- Problem Statement 
+- Solution/Services
+- Case Studies/Examples
+- How It Works/Process
+- Pricing/Plans
+- Team/About
+- Call to Action
+- Footer
+
+Return results as a valid JSON array:
+[
+  {
+    "type": "Hero Section",
+    "coordinates": {"top": 0, "right": 100, "bottom": 30, "left": 0},
+    "description": "Main value proposition with headline and CTA buttons"
   },
-  "description": "brief description"
-}`;
+  ...
+]`;
 
     const response = await fetch('https://api.openai.com/v1/chat/completions', {
       method: 'POST',
@@ -359,24 +360,13 @@ Return the results as a valid JSON array with objects containing:
   }
 }
 
-// Function to capture screenshots for sections and analyze them
-async function captureAndAnalyzeSections(page, sections) {
+// New function for lightweight analysis (summary mode)
+async function performLightweightAnalysis(page, sections, dimensions) {
   const sectionResults = [];
   
-  // Handle viewport width/height for calculating coordinates
-  const dimensions = await page.evaluate(() => {
-    return {
-      width: document.documentElement.scrollWidth,
-      height: document.documentElement.scrollHeight
-    };
-  });
-  
-  console.log(`Page dimensions: ${dimensions.width}x${dimensions.height}`);
-  
-  // For each identified section, capture a screenshot
   for (const section of sections) {
     try {
-      console.log(`Processing section: ${section.type}`);
+      console.log(`Processing section for summary analysis: ${section.type}`);
       
       // Convert percentage coordinates to pixels
       const clip = {
@@ -386,7 +376,7 @@ async function captureAndAnalyzeSections(page, sections) {
         height: Math.floor(((section.coordinates.bottom - section.coordinates.top) * dimensions.height) / 100)
       };
       
-      // Ensure valid clip dimensions (minimum 10x10 pixels)
+      // Ensure valid clip dimensions
       if (clip.width < 10) clip.width = 10;
       if (clip.height < 10) clip.height = 10;
       
@@ -400,8 +390,8 @@ async function captureAndAnalyzeSections(page, sections) {
       
       console.log(`Captured screenshot for ${section.type}`);
       
-      // Analyze the section with GPT-4 Vision using framework-based prompts
-      const analysis = await analyzeSectionWithGPT4Vision(
+      // Perform lightweight analysis for quick scoring
+      const analysis = await performLightweightSectionAnalysis(
         `data:image/png;base64,${sectionScreenshot}`, 
         section.type
       );
@@ -410,7 +400,8 @@ async function captureAndAnalyzeSections(page, sections) {
         type: section.type,
         description: section.description,
         screenshot: `data:image/png;base64,${sectionScreenshot}`,
-        analysis
+        analysis,
+        coordinates: section.coordinates
       });
       
     } catch (error) {
@@ -421,7 +412,180 @@ async function captureAndAnalyzeSections(page, sections) {
   return sectionResults;
 }
 
-// Function to analyze a section with GPT-4 Vision
+// Function for the lightweight analysis prompt (summary mode)
+async function performLightweightSectionAnalysis(screenshotBase64, sectionType) {
+  try {
+    console.log(`Performing lightweight analysis for ${sectionType}...`);
+    
+    const lightweightPrompt = `Analyze this ${sectionType} screenshot for a quick assessment.
+
+Focus only on the essential elements to provide a brief analysis:
+
+1. What are the most noticeable text elements and content?
+2. What is the main purpose of this section?
+3. What is working well (1-2 points only)?
+4. What could be improved (1-2 points only)?
+
+Return your analysis in this JSON format:
+{
+  "whatWeFound": [
+    "Key observation 1",
+    "Key observation 2"
+  ],
+  "whatsWorking": [
+    "One positive aspect"
+  ],
+  "improvements": [
+    "One improvement suggestion"
+  ],
+  "pulledQuote": "The main headline or key text from this section",
+  "buyerInsight": "Brief assessment of section effectiveness for target buyers"
+}`;
+
+    const response = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`
+      },
+      body: JSON.stringify({
+        model: "gpt-4o",
+        messages: [
+          {
+            role: "user",
+            content: [
+              {
+                type: "text",
+                text: lightweightPrompt
+              },
+              {
+                type: "image_url",
+                image_url: { url: screenshotBase64 }
+              }
+            ]
+          }
+        ],
+        max_tokens: 1000 // Reduced for lightweight analysis
+      })
+    });
+    
+    const data = await response.json();
+    
+    if (!data.choices || !data.choices[0] || !data.choices[0].message) {
+      console.error(`Unexpected lightweight analysis response for ${sectionType}:`, data);
+      return getDefaultLightweightAnalysis(sectionType);
+    }
+    
+    const content = data.choices[0].message.content;
+    
+    // Extract JSON from the response
+    const jsonMatch = content.match(/```json([\s\S]*?)```/) || 
+                      content.match(/\{[\s\S]*\}/);
+                     
+    if (jsonMatch) {
+      try {
+        // Clean up the JSON string
+        const jsonContent = jsonMatch[0].replace(/```json|```/g, '');
+        const analysis = JSON.parse(jsonContent);
+        
+        // Add placeholder for bestPractices to maintain compatibility
+        analysis.bestPractices = [
+          {
+            company: "Example Company",
+            description: "See detailed analysis for best practices"
+          }
+        ];
+        
+        return analysis;
+      } catch (e) {
+        console.error(`Failed to parse lightweight analysis for ${sectionType}:`, e);
+      }
+    }
+    
+    return getDefaultLightweightAnalysis(sectionType);
+  } catch (error) {
+    console.error(`Error in lightweight analysis for ${sectionType}:`, error);
+    return getDefaultLightweightAnalysis(sectionType);
+  }
+}
+
+// Helper function for default lightweight analysis
+function getDefaultLightweightAnalysis(sectionType) {
+  return {
+    whatWeFound: [
+      `This appears to be a ${sectionType}`,
+      "Basic content is visible but detailed analysis is available in full mode"
+    ],
+    whatsWorking: [
+      "Section layout appears organized"
+    ],
+    improvements: [
+      "See detailed analysis for specific improvements"
+    ],
+    pulledQuote: "Key text unavailable in summary mode",
+    buyerInsight: "See detailed analysis for buyer insights",
+    bestPractices: [
+      {
+        company: "Example Company",
+        description: "See detailed analysis for best practices"
+      }
+    ]
+  };
+}
+
+// Function for detailed analysis (using existing analysis framework)
+async function performDetailedAnalysis(page, sections, dimensions) {
+  const sectionResults = [];
+  
+  for (const section of sections) {
+    try {
+      console.log(`Processing section for detailed analysis: ${section.type}`);
+      
+      // Convert percentage coordinates to pixels
+      const clip = {
+        x: Math.floor((section.coordinates.left * dimensions.width) / 100),
+        y: Math.floor((section.coordinates.top * dimensions.height) / 100),
+        width: Math.floor(((section.coordinates.right - section.coordinates.left) * dimensions.width) / 100),
+        height: Math.floor(((section.coordinates.bottom - section.coordinates.top) * dimensions.height) / 100)
+      };
+      
+      // Ensure valid clip dimensions
+      if (clip.width < 10) clip.width = 10;
+      if (clip.height < 10) clip.height = 10;
+      
+      console.log(`Section clip: x=${clip.x}, y=${clip.y}, width=${clip.width}, height=${clip.height}`);
+      
+      // Take screenshot of just this section
+      const sectionScreenshot = await page.screenshot({
+        clip,
+        encoding: 'base64'
+      });
+      
+      console.log(`Captured screenshot for ${section.type}`);
+      
+      // Use the full audit framework for detailed analysis (existing function)
+      const analysis = await analyzeSectionWithGPT4Vision(
+        `data:image/png;base64,${sectionScreenshot}`, 
+        section.type
+      );
+      
+      sectionResults.push({
+        type: section.type,
+        description: section.description,
+        screenshot: `data:image/png;base64,${sectionScreenshot}`,
+        analysis,
+        coordinates: section.coordinates
+      });
+      
+    } catch (error) {
+      console.error(`Error processing section ${section.type}:`, error.message);
+    }
+  }
+  
+  return sectionResults;
+}
+
+// Existing analysis function (kept for detailed mode)
 async function analyzeSectionWithGPT4Vision(screenshotBase64, sectionType) {
   try {
     console.log(`Analyzing ${sectionType} with GPT-4 Vision...`);
@@ -520,17 +684,17 @@ Return your analysis in this exact JSON format:
   // Add section-specific criteria based on type
   let sectionSpecificPrompt = '';
   
-  if (sectionType === 'Hero Section') {
+  if (sectionType.includes('Hero')) {
     sectionSpecificPrompt = `
   "buyerInsight": "An assessment of how this hero section would be perceived by your target buyer",
   "pulledQuote": "The main headline or key message from this section",`;
   } 
-  else if (sectionType.includes('Trust') || sectionType.includes('Case Studies') || sectionType.includes('Proof')) {
+  else if (sectionType.includes('Trust') || sectionType.includes('Case Studies') || sectionType.includes('Proof') || sectionType.includes('Testimonial')) {
     sectionSpecificPrompt = `
   "buyerInsight": "How effectively this builds credibility with your target audience",
   "pulledQuote": "A key claim or statement from this section",`;
   }
-  else if (sectionType.includes('Call to Action')) {
+  else if (sectionType.includes('Call to Action') || sectionType.includes('CTA')) {
     sectionSpecificPrompt = `
   "buyerInsight": "How compelling this CTA would be to your target buyer",
   "pulledQuote": "The exact CTA text or button label",`;
