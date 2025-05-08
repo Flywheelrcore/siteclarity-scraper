@@ -5,15 +5,15 @@ puppeteer.use(StealthPlugin());
 const app = express();
 app.use(express.json());
 
-// Define common section types we want to identify
+// Define standardized section types aligned with the audit framework
 const SECTION_TYPES = [
   "Hero Section",
   "Problem Statement",
-  "Features/Benefits",
-  "Testimonials",
-  "About Us",
-  "Services",
+  "Solution/Services",
+  "Trust/Proof Elements",
+  "Case Studies",
   "Call to Action",
+  "Thought Leadership",
   "Footer"
 ];
 
@@ -150,20 +150,24 @@ app.post("/scrape", async (req, res) => {
     const screenshotBase64 = await takeScreenshot(false); // Desktop
     const mobileScreenshotBase64 = await takeScreenshot(true); // Mobile
 
-    // New addition: Use GPT-4 Vision to analyze and identify sections
+    // Use GPT-4 Vision to analyze and identify sections
     let sectionAnalyses = [];
     if (process.env.OPENAI_API_KEY && screenshotBase64) {
       try {
         console.log("🧠 Using GPT-4 Vision to identify page sections...");
         
-        // First identify the sections
+        // First identify the sections with improved prompt
         const sections = await identifySectionsWithGPT4Vision(`data:image/png;base64,${screenshotBase64}`);
         
         if (sections && sections.length > 0) {
-          console.log(`✅ Identified ${sections.length} sections on the page`);
+          console.log(`✅ Identified ${sections.length} sections on the page before deduplication`);
+          
+          // Deduplicate sections to avoid redundancy
+          const uniqueSections = deduplicateSections(sections);
+          console.log(`✅ Reduced to ${uniqueSections.length} unique sections after deduplication`);
           
           // For each section, capture a screenshot and analyze it
-          sectionAnalyses = await captureAndAnalyzeSections(page, sections);
+          sectionAnalyses = await captureAndAnalyzeSections(page, uniqueSections);
           
           console.log(`✅ Completed analysis for ${sectionAnalyses.length} sections`);
         }
@@ -209,9 +213,78 @@ app.post("/scrape", async (req, res) => {
   }
 });
 
+// Function to deduplicate sections based on position and type
+function deduplicateSections(sections) {
+  // Sort sections by vertical position (top coordinate)
+  const sortedSections = [...sections].sort((a, b) => a.coordinates.top - b.coordinates.top);
+  
+  // Group sections by type
+  const sectionsByType = {};
+  const finalSections = [];
+  
+  sortedSections.forEach(section => {
+    const type = section.type;
+    
+    // If we haven't seen this type before, add it
+    if (!sectionsByType[type]) {
+      sectionsByType[type] = section;
+      finalSections.push(section);
+    } else {
+      // If we have seen this type, only add if it's significantly different in position
+      const existingSection = sectionsByType[type];
+      const positionDifference = Math.abs(section.coordinates.top - existingSection.coordinates.top);
+      
+      // If the section is more than 20% of page height away from the existing one, consider it distinct
+      if (positionDifference > 20) {
+        // Add with modified type to indicate it's a second instance
+        finalSections.push({
+          ...section,
+          type: `${type} (Additional)`
+        });
+      }
+    }
+  });
+  
+  return finalSections;
+}
+
 // Function to identify sections using GPT-4 Vision
 async function identifySectionsWithGPT4Vision(screenshotBase64) {
   try {
+    const sectionIdentificationPrompt = `Analyze this website screenshot and identify the main horizontal sections.
+
+For each section, consider complete horizontal elements that span across the page. For example, a hero section typically spans the entire width at the top of the page.
+
+Only identify main content sections that are distinct parts of the user journey, not small UI elements or sub-components.
+
+For each section you identify, provide:
+1. section_type (choose ONLY from this list: 
+   - Hero Section: The top area with main heading/value proposition
+   - Problem Statement: Area highlighting pain points or challenges
+   - Solution/Services: Area describing offerings or how problems are solved
+   - Trust/Proof Elements: Client logos, testimonials, awards, social proof
+   - Case Studies: Detailed examples of work or success stories
+   - Call to Action: Areas designed to prompt user action
+   - Thought Leadership: Content like blogs, resources, or insights
+   - Footer: Bottom section with contact info and navigation
+)
+2. coordinates as percentages of the image (top, right, bottom, left)
+   - Ensure sections span the full width where appropriate (left near 0, right near 100)
+   - Avoid overlapping sections
+3. brief description of what the section contains
+
+Return the results as a valid JSON array with objects containing: 
+{
+  "type": "section type name",
+  "coordinates": {
+    "top": number,
+    "right": number,
+    "bottom": number,
+    "left": number
+  },
+  "description": "brief description"
+}`;
+
     const response = await fetch('https://api.openai.com/v1/chat/completions', {
       method: 'POST',
       headers: {
@@ -219,31 +292,14 @@ async function identifySectionsWithGPT4Vision(screenshotBase64) {
         'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`
       },
       body: JSON.stringify({
-        model: "gpt-4o", // UPDATED: Using gpt-4o instead of gpt-4-vision-preview
+        model: "gpt-4o",
         messages: [
           {
             role: "user",
             content: [
               {
                 type: "text",
-                text: `Analyze this website screenshot and identify the main sections.
-                For each section you find, provide:
-                1. section_type (choose from: Hero Section, Problem Statement, Features/Benefits, 
-                   Testimonials, About Us, Services, Call to Action, Footer, or a more appropriate label if none fit)
-                2. coordinates as percentages of the image (top, right, bottom, left)
-                3. brief description of what the section contains
-
-                Return the results as a valid JSON array with objects containing: 
-                {
-                  "type": "section type name",
-                  "coordinates": {
-                    "top": number,
-                    "right": number,
-                    "bottom": number,
-                    "left": number
-                  },
-                  "description": "brief description"
-                }`
+                text: sectionIdentificationPrompt
               },
               {
                 type: "image_url",
@@ -252,7 +308,7 @@ async function identifySectionsWithGPT4Vision(screenshotBase64) {
             ]
           }
         ],
-        max_tokens: 2000
+        max_tokens: 2500
       })
     });
     
@@ -344,7 +400,7 @@ async function captureAndAnalyzeSections(page, sections) {
       
       console.log(`Captured screenshot for ${section.type}`);
       
-      // Analyze the section with GPT-4 Vision
+      // Analyze the section with GPT-4 Vision using framework-based prompts
       const analysis = await analyzeSectionWithGPT4Vision(
         `data:image/png;base64,${sectionScreenshot}`, 
         section.type
@@ -370,6 +426,9 @@ async function analyzeSectionWithGPT4Vision(screenshotBase64, sectionType) {
   try {
     console.log(`Analyzing ${sectionType} with GPT-4 Vision...`);
     
+    // Get section-specific prompt based on the audit framework
+    const analysisPrompt = getSectionAnalysisPrompt(sectionType);
+    
     const response = await fetch('https://api.openai.com/v1/chat/completions', {
       method: 'POST',
       headers: {
@@ -377,42 +436,14 @@ async function analyzeSectionWithGPT4Vision(screenshotBase64, sectionType) {
         'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`
       },
       body: JSON.stringify({
-        model: "gpt-4o", // UPDATED: Using gpt-4o instead of gpt-4-vision-preview
+        model: "gpt-4o",
         messages: [
           {
             role: "user",
             content: [
               {
                 type: "text",
-                text: `Analyze this ${sectionType} of a website and provide detailed feedback on messaging clarity.
-                
-                Return your analysis in this exact JSON format:
-                {
-                  "whatWeFound": [
-                    "Bullet point observations about the content",
-                    "Another observation..."
-                  ],
-                  "whatsWorking": [
-                    "First positive aspect",
-                    "Second positive aspect",
-                    "Third positive aspect"
-                  ],
-                  "improvements": [
-                    "First suggested improvement",
-                    "Second suggested improvement",
-                    "Third suggested improvement"
-                  ],
-                  "bestPractices": [
-                    {
-                      "company": "Example Company Name",
-                      "description": "Brief description of their good practice"
-                    },
-                    {
-                      "company": "Another Company",
-                      "description": "Brief description of their good practice"
-                    }
-                  ]
-                }`
+                text: analysisPrompt
               },
               {
                 type: "image_url",
@@ -421,7 +452,7 @@ async function analyzeSectionWithGPT4Vision(screenshotBase64, sectionType) {
             ]
           }
         ],
-        max_tokens: 1500
+        max_tokens: 2000
       })
     });
     
@@ -457,17 +488,87 @@ async function analyzeSectionWithGPT4Vision(screenshotBase64, sectionType) {
   }
 }
 
+// Function to generate section-specific prompts based on the audit framework
+function getSectionAnalysisPrompt(sectionType) {
+  // Base prompt for all section types
+  const basePrompt = `Analyze this ${sectionType} of a website using the SiteClarity audit framework. 
+  
+Evaluate the section based on these key criteria:
+1. Messaging Clarity: Is it clear what they do, who it's for, and the value?
+2. Conversion Potential: Does it guide users toward meaningful action?
+3. Audience Alignment: Is it tailored to a specific ICP (e.g., CIO, CTO)?
+4. Visual & UX Integrity: Is the design modern, clean, and intuitive?
+5. CTA & SEO Effectiveness: Are CTAs value-focused and content optimized?
+
+Return your analysis in this exact JSON format:
+{
+  "whatWeFound": [
+    "Detailed observation about the content and layout",
+    "Specific elements, text, and visuals present"
+  ],
+  "whatsWorking": [
+    "Positive aspect related to messaging clarity",
+    "Positive aspect related to audience targeting",
+    "Positive aspect related to visual design"
+  ],
+  "improvements": [
+    "Specific improvement suggestion with reasoning",
+    "Another improvement with clear rationale",
+    "Actionable suggestion to enhance effectiveness"
+  ],`;
+
+  // Add section-specific criteria based on type
+  let sectionSpecificPrompt = '';
+  
+  if (sectionType === 'Hero Section') {
+    sectionSpecificPrompt = `
+  "buyerInsight": "An assessment of how this hero section would be perceived by your target buyer",
+  "pulledQuote": "The main headline or key message from this section",`;
+  } 
+  else if (sectionType.includes('Trust') || sectionType.includes('Case Studies') || sectionType.includes('Proof')) {
+    sectionSpecificPrompt = `
+  "buyerInsight": "How effectively this builds credibility with your target audience",
+  "pulledQuote": "A key claim or statement from this section",`;
+  }
+  else if (sectionType.includes('Call to Action')) {
+    sectionSpecificPrompt = `
+  "buyerInsight": "How compelling this CTA would be to your target buyer",
+  "pulledQuote": "The exact CTA text or button label",`;
+  }
+  else {
+    sectionSpecificPrompt = `
+  "buyerInsight": "How this section contributes to overall messaging effectiveness",
+  "pulledQuote": "A key phrase or message from this section",`;
+  }
+
+  // Complete the prompt with best practices
+  const completionPrompt = `
+  "bestPractices": [
+    {
+      "company": "Example Company Name",
+      "description": "How they excel at this type of section"
+    },
+    {
+      "company": "Another Company",
+      "description": "Their effective approach to this section type"
+    }
+  ]
+}`;
+
+  return basePrompt + sectionSpecificPrompt + completionPrompt;
+}
+
 // Helper function to generate default analysis if GPT-4 Vision fails
 function getDefaultAnalysis(sectionType) {
-  return {
+  // Create more specific default analyses based on section type
+  const baseAnalysis = {
     whatWeFound: [
       `This appears to be a ${sectionType}`,
-      "Unable to perform detailed analysis",
-      "Please try again later"
+      "Content and structure are visible but detailed analysis failed"
     ],
     whatsWorking: [
-      "Section structure seems appropriate",
-      "Layout appears consistent"
+      "Section layout appears organized",
+      "Visual elements are present"
     ],
     improvements: [
       "Consider enhancing messaging clarity",
@@ -485,6 +586,12 @@ function getDefaultAnalysis(sectionType) {
       }
     ]
   };
+  
+  // Add default buyerInsight and pulledQuote
+  baseAnalysis.buyerInsight = "Analysis could not determine audience targeting effectiveness";
+  baseAnalysis.pulledQuote = "Unable to extract key message";
+  
+  return baseAnalysis;
 }
 
 // Add a simple healthcheck endpoint
