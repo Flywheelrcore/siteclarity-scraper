@@ -80,34 +80,91 @@ app.post("/scrape", async (req, res) => {
     // Set request timeout to 2 minutes
     await page.setDefaultNavigationTimeout(120000);
     
-    // Define a function to take screenshots with error handling
-    const takeScreenshot = async (isMobile = false) => {
-      try {
-        // Set appropriate viewport
-        if (isMobile) {
-          await page.setViewport({ 
-            width: 390, 
-            height: 844, 
-            isMobile: true,
-            hasTouch: true 
+    // Define a function to take screenshots with error handling and retries
+    const takeScreenshot = async (isMobile = false, maxRetries = 3) => {
+      let attempts = 0;
+      let screenshot = "";
+      
+      while (attempts < maxRetries) {
+        try {
+          attempts++;
+          
+          // Set appropriate viewport
+          if (isMobile) {
+            await page.setViewport({ 
+              width: 390, 
+              height: 844, 
+              isMobile: true,
+              hasTouch: true 
+            });
+            
+            // Wait for mobile layout to adjust
+            await new Promise(resolve => setTimeout(resolve, 2000));
+            
+            console.log(`📱 Taking mobile screenshot (attempt ${attempts}/${maxRetries})...`);
+            const buffer = await page.screenshot({ fullPage: false });
+            return buffer.toString("base64");
+          } else {
+            // Desktop screenshot
+            console.log(`📸 Taking desktop screenshot (attempt ${attempts}/${maxRetries})...`);
+            const buffer = await page.screenshot({ fullPage: true });
+            return buffer.toString("base64");
+          }
+        } catch (error) {
+          console.error(`Screenshot error (${isMobile ? 'mobile' : 'desktop'}) attempt ${attempts}/${maxRetries}:`, error.message);
+          
+          if (attempts >= maxRetries) {
+            console.error(`All ${maxRetries} screenshot attempts failed for ${isMobile ? 'mobile' : 'desktop'}`);
+            return ""; // Return empty string after all retries fail
+          }
+          
+          // Wait before retry (increasing delay with each attempt)
+          const delay = attempts * 1000;
+          console.log(`Retrying in ${delay}ms...`);
+          await new Promise(resolve => setTimeout(resolve, delay));
+        }
+      }
+      
+      return screenshot;
+    };
+    
+    // Take section screenshot with retries
+    const takeSectionScreenshot = async (clip, sectionType, maxRetries = 3) => {
+      let attempts = 0;
+      
+      while (attempts < maxRetries) {
+        try {
+          attempts++;
+          console.log(`Taking screenshot for ${sectionType} (attempt ${attempts}/${maxRetries})...`);
+          
+          // Ensure clip is valid
+          if (clip.width < 10) clip.width = 10;
+          if (clip.height < 10) clip.height = 10;
+          
+          // Take screenshot of just this section
+          const buffer = await page.screenshot({
+            clip,
+            encoding: 'base64'
           });
           
-          // Wait for mobile layout to adjust
-          await new Promise(resolve => setTimeout(resolve, 2000));
+          console.log(`✅ Successfully captured screenshot for ${sectionType}`);
+          return buffer;
+        } catch (error) {
+          console.error(`Section screenshot error for ${sectionType} (attempt ${attempts}/${maxRetries}):`, error.message);
           
-          console.log("📱 Taking mobile screenshot...");
-          const buffer = await page.screenshot({ fullPage: false });
-          return buffer.toString("base64");
-        } else {
-          // Desktop screenshot
-          console.log("📸 Taking desktop screenshot...");
-          const buffer = await page.screenshot({ fullPage: true });
-          return buffer.toString("base64");
+          if (attempts >= maxRetries) {
+            console.error(`❌ All ${maxRetries} section screenshot attempts failed for ${sectionType}`);
+            return null; // Return null after all retries fail
+          }
+          
+          // Wait before retry (increasing delay with each attempt)
+          const delay = attempts * 1000;
+          console.log(`Retrying in ${delay}ms...`);
+          await new Promise(resolve => setTimeout(resolve, delay));
         }
-      } catch (error) {
-        console.error(`Screenshot error (${isMobile ? 'mobile' : 'desktop'}):`, error.message);
-        return ""; // Return empty string on error
       }
+      
+      return null;
     };
     
     // Try to navigate to the page with retry logic
@@ -147,12 +204,13 @@ app.post("/scrape", async (req, res) => {
     }
     
     // Take screenshots even if navigation wasn't completely successful
-    const screenshotBase64 = await takeScreenshot(false); // Desktop
-    const mobileScreenshotBase64 = await takeScreenshot(true); // Mobile
+    const screenshotBase64 = await takeScreenshot(false, 3); // Desktop with retries
+    const mobileScreenshotBase64 = await takeScreenshot(true, 3); // Mobile with retries
 
     // PHASE 1: Identify logical sections from full page screenshot
     let identifiedSections = [];
     let sectionAnalyses = [];
+    let failedSections = []; // New array to track failed sections
     
     if (process.env.OPENAI_API_KEY && screenshotBase64) {
       try {
@@ -189,16 +247,23 @@ app.post("/scrape", async (req, res) => {
           // PHASE 2: Based on analysis mode, perform appropriate level of analysis
           if (analysisMode === "summary") {
             // For summary mode: Perform lightweight analysis for quick results
-            sectionAnalyses = await performLightweightAnalysis(page, identifiedSections, dimensions);
+            const { analyses, failed } = await performLightweightAnalysis(page, identifiedSections, dimensions, takeSectionScreenshot);
+            sectionAnalyses = analyses;
+            failedSections = failed;
           } else if (analysisMode === "detailed") {
             // For detailed mode: Perform comprehensive analysis with full audit framework
-            sectionAnalyses = await performDetailedAnalysis(page, identifiedSections, dimensions);
+            const { analyses, failed } = await performDetailedAnalysis(page, identifiedSections, dimensions, takeSectionScreenshot);
+            sectionAnalyses = analyses;
+            failedSections = failed;
           } else {
             // Default to summary if mode is unknown
-            sectionAnalyses = await performLightweightAnalysis(page, identifiedSections, dimensions);
+            const { analyses, failed } = await performLightweightAnalysis(page, identifiedSections, dimensions, takeSectionScreenshot);
+            sectionAnalyses = analyses;
+            failedSections = failed;
           }
           
           console.log(`✅ Completed ${analysisMode} analysis for ${sectionAnalyses.length} sections`);
+          console.log(`⚠️ Failed to analyze ${failedSections.length} sections`);
         }
       } catch (visionError) {
         console.error("❌ Error during section analysis:", visionError.message);
@@ -213,18 +278,89 @@ app.post("/scrape", async (req, res) => {
       await browser.close();
     }
     
-    // Return what we have, with mode information
+    // Format section analyses to match frontend expectations
+    const formattedSectionAnalyses = sectionAnalyses.map(section => {
+      // Convert section type to a valid section_id in lowercase with hyphens
+      const section_id = section.type
+        .toLowerCase()
+        .replace(/\s+/g, '-')
+        .replace(/[^a-z0-9-]/g, '');
+      
+      // Format analysis data to match expected structure
+      const analysis = section.analysis || {};
+      
+      return {
+        section_id,
+        section_name: section.type,
+        screenshot_url: section.screenshot, 
+        extracted_content: {
+          headline: analysis.pulledQuote || "",
+          subheadline: "",
+          cta_text: section.type.includes("Call to Action") ? analysis.pulledQuote || "" : "",
+          supporting_text: analysis.whatWeFound || []
+        },
+        content: {
+          description: section.description || `Analysis of your ${section.type}`,
+          found: analysis.whatWeFound || [],
+          working: analysis.whatsWorking || [],
+          improvements: analysis.improvements || [],
+          examples: analysis.bestPractices || [],
+          pulledQuote: analysis.pulledQuote || "",
+          buyerInsight: analysis.buyerInsight || ""
+        }
+      };
+    });
+    
+    // Add failed sections with appropriate format
+    const formattedFailedSections = failedSections.map(failedSection => {
+      const section_id = failedSection
+        .toLowerCase()
+        .replace(/\s+/g, '-')
+        .replace(/[^a-z0-9-]/g, '');
+        
+      return {
+        section_id,
+        section_name: failedSection,
+        screenshot_url: "", 
+        extraction_failed: true,
+        extracted_content: {
+          headline: "",
+          subheadline: "",
+          cta_text: "",
+          supporting_text: [`Could not analyze ${failedSection} section`]
+        },
+        content: {
+          description: `We couldn't fully analyze this ${failedSection} section.`,
+          found: [`Section identified but couldn't capture screenshot`],
+          working: ["Unable to determine what's working"],
+          improvements: ["Make this section easier to analyze by using standard HTML structure"],
+          examples: [
+            {
+              company: "Example Company",
+              description: "Clear structure with standard HTML elements"
+            }
+          ],
+          extractionFailed: true
+        }
+      };
+    });
+    
+    // Combine successful and failed sections
+    const allSectionAnalyses = [...formattedSectionAnalyses, ...formattedFailedSections];
+    
+    // Return what we have, with mode information and extraction stats
     return res.json({
       success: true,
       analysisMode,
       screenshotBase64,
       mobileScreenshotBase64,
-      sectionAnalyses,
-      extracted_content: {
-        headline: "",
-        subheadline: "",
-        cta_text: "",
-        supporting_text: []
+      sectionAnalyses: allSectionAnalyses,
+      fullPageScreenshotUrl: `data:image/png;base64,${screenshotBase64}`,
+      fullPageMobileScreenshotUrl: `data:image/png;base64,${mobileScreenshotBase64}`,
+      extractionStats: {
+        totalSections: identifiedSections.length,
+        successfulSections: formattedSectionAnalyses.length,
+        failedSections: formattedFailedSections.map(s => s.section_id)
       }
     });
   } catch (err) {
@@ -242,6 +378,100 @@ app.post("/scrape", async (req, res) => {
     return res.status(500).json({ success: false, error: err.message });
   }
 });
+
+// Modified function for lightweight analysis (summary mode) with retry logic
+async function performLightweightAnalysis(page, sections, dimensions, takeSectionScreenshot) {
+  const sectionResults = [];
+  const failedSections = [];
+  
+  for (const section of sections) {
+    try {
+      console.log(`Processing section for summary analysis: ${section.type}`);
+      
+      // Convert percentage coordinates to pixels
+      const clip = {
+        x: Math.floor((section.coordinates.left * dimensions.width) / 100),
+        y: Math.floor((section.coordinates.top * dimensions.height) / 100),
+        width: Math.floor(((section.coordinates.right - section.coordinates.left) * dimensions.width) / 100),
+        height: Math.floor(((section.coordinates.bottom - section.coordinates.top) * dimensions.height) / 100)
+      };
+      
+      // Try to take screenshot with retries
+      const sectionScreenshot = await takeSectionScreenshot(clip, section.type, 3);
+      
+      if (sectionScreenshot) {
+        // Perform lightweight analysis for quick scoring
+        const analysis = await performLightweightSectionAnalysis(
+          `data:image/png;base64,${sectionScreenshot}`, 
+          section.type
+        );
+        
+        sectionResults.push({
+          type: section.type,
+          description: section.description,
+          screenshot: `data:image/png;base64,${sectionScreenshot}`,
+          analysis,
+          coordinates: section.coordinates
+        });
+      } else {
+        console.log(`⚠️ Adding ${section.type} to failed sections list`);
+        failedSections.push(section.type);
+      }
+    } catch (error) {
+      console.error(`Error processing section ${section.type}:`, error.message);
+      failedSections.push(section.type);
+    }
+  }
+  
+  return { analyses: sectionResults, failed: failedSections };
+}
+
+// Modified function for detailed analysis with retry logic
+async function performDetailedAnalysis(page, sections, dimensions, takeSectionScreenshot) {
+  const sectionResults = [];
+  const failedSections = [];
+  
+  for (const section of sections) {
+    try {
+      console.log(`Processing section for detailed analysis: ${section.type}`);
+      
+      // Convert percentage coordinates to pixels
+      const clip = {
+        x: Math.floor((section.coordinates.left * dimensions.width) / 100),
+        y: Math.floor((section.coordinates.top * dimensions.height) / 100),
+        width: Math.floor(((section.coordinates.right - section.coordinates.left) * dimensions.width) / 100),
+        height: Math.floor(((section.coordinates.bottom - section.coordinates.top) * dimensions.height) / 100)
+      };
+      
+      // Try to take screenshot with retries
+      const sectionScreenshot = await takeSectionScreenshot(clip, section.type, 3);
+      
+      if (sectionScreenshot) {
+        // Use the full audit framework for detailed analysis
+        const analysis = await analyzeSectionWithGPT4Vision(
+          `data:image/png;base64,${sectionScreenshot}`, 
+          section.type
+        );
+        
+        sectionResults.push({
+          type: section.type,
+          description: section.description,
+          screenshot: `data:image/png;base64,${sectionScreenshot}`,
+          analysis,
+          coordinates: section.coordinates
+        });
+      } else {
+        console.log(`⚠️ Adding ${section.type} to failed sections list`);
+        failedSections.push(section.type);
+      }
+    } catch (error) {
+      console.error(`Error processing section ${section.type}:`, error.message);
+      failedSections.push(section.type);
+    }
+  }
+  
+  return { analyses: sectionResults, failed: failedSections };
+}
 
 // New function to identify logical sections using a human-like approach
 async function identifyLogicalSectionsWithGPT4Vision(screenshotBase64) {
@@ -360,59 +590,7 @@ Return results as a valid JSON array:
   }
 }
 
-// New function for lightweight analysis (summary mode)
-async function performLightweightAnalysis(page, sections, dimensions) {
-  const sectionResults = [];
-  
-  for (const section of sections) {
-    try {
-      console.log(`Processing section for summary analysis: ${section.type}`);
-      
-      // Convert percentage coordinates to pixels
-      const clip = {
-        x: Math.floor((section.coordinates.left * dimensions.width) / 100),
-        y: Math.floor((section.coordinates.top * dimensions.height) / 100),
-        width: Math.floor(((section.coordinates.right - section.coordinates.left) * dimensions.width) / 100),
-        height: Math.floor(((section.coordinates.bottom - section.coordinates.top) * dimensions.height) / 100)
-      };
-      
-      // Ensure valid clip dimensions
-      if (clip.width < 10) clip.width = 10;
-      if (clip.height < 10) clip.height = 10;
-      
-      console.log(`Section clip: x=${clip.x}, y=${clip.y}, width=${clip.width}, height=${clip.height}`);
-      
-      // Take screenshot of just this section
-      const sectionScreenshot = await page.screenshot({
-        clip,
-        encoding: 'base64'
-      });
-      
-      console.log(`Captured screenshot for ${section.type}`);
-      
-      // Perform lightweight analysis for quick scoring
-      const analysis = await performLightweightSectionAnalysis(
-        `data:image/png;base64,${sectionScreenshot}`, 
-        section.type
-      );
-      
-      sectionResults.push({
-        type: section.type,
-        description: section.description,
-        screenshot: `data:image/png;base64,${sectionScreenshot}`,
-        analysis,
-        coordinates: section.coordinates
-      });
-      
-    } catch (error) {
-      console.error(`Error processing section ${section.type}:`, error.message);
-    }
-  }
-  
-  return sectionResults;
-}
-
-// Function for the lightweight analysis prompt (summary mode)
+// Function for lightweight analysis prompt (summary mode)
 async function performLightweightSectionAnalysis(screenshotBase64, sectionType) {
   try {
     console.log(`Performing lightweight analysis for ${sectionType}...`);
@@ -531,58 +709,6 @@ function getDefaultLightweightAnalysis(sectionType) {
       }
     ]
   };
-}
-
-// Function for detailed analysis (using existing analysis framework)
-async function performDetailedAnalysis(page, sections, dimensions) {
-  const sectionResults = [];
-  
-  for (const section of sections) {
-    try {
-      console.log(`Processing section for detailed analysis: ${section.type}`);
-      
-      // Convert percentage coordinates to pixels
-      const clip = {
-        x: Math.floor((section.coordinates.left * dimensions.width) / 100),
-        y: Math.floor((section.coordinates.top * dimensions.height) / 100),
-        width: Math.floor(((section.coordinates.right - section.coordinates.left) * dimensions.width) / 100),
-        height: Math.floor(((section.coordinates.bottom - section.coordinates.top) * dimensions.height) / 100)
-      };
-      
-      // Ensure valid clip dimensions
-      if (clip.width < 10) clip.width = 10;
-      if (clip.height < 10) clip.height = 10;
-      
-      console.log(`Section clip: x=${clip.x}, y=${clip.y}, width=${clip.width}, height=${clip.height}`);
-      
-      // Take screenshot of just this section
-      const sectionScreenshot = await page.screenshot({
-        clip,
-        encoding: 'base64'
-      });
-      
-      console.log(`Captured screenshot for ${section.type}`);
-      
-      // Use the full audit framework for detailed analysis (existing function)
-      const analysis = await analyzeSectionWithGPT4Vision(
-        `data:image/png;base64,${sectionScreenshot}`, 
-        section.type
-      );
-      
-      sectionResults.push({
-        type: section.type,
-        description: section.description,
-        screenshot: `data:image/png;base64,${sectionScreenshot}`,
-        analysis,
-        coordinates: section.coordinates
-      });
-      
-    } catch (error) {
-      console.error(`Error processing section ${section.type}:`, error.message);
-    }
-  }
-  
-  return sectionResults;
 }
 
 // Existing analysis function (kept for detailed mode)
